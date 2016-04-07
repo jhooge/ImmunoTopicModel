@@ -1,0 +1,657 @@
+ ---
+title: "Biomedical Topic Modeling on Cancer Immunotherapy"
+author: "Jens Hooge"
+date: "16. Februar 2016"
+output: html_document
+---
+
+# Introduction
+Topic models are probabilistic latent variable models of documents that exploit the correlations among the words and latent semantic themes” (Blei and Lafferty, 2007). The name "topics" signifies the hidden, to be estimated, variable relations (=distributions) that link words in a vocabulary and their occurrence in documents. A document is seen as a mixture of topics. This intuitive explanation of how documents can be generated is modeled as a stochastic process which is then "reversed"" (Blei and Lafferty, 2009) by machine learning techniques that return estimates of the latent variables. With these estimates it is possible to perform information retrieval or text mining tasks on a document corpus.
+
+# Loading required libraries
+In this study we will utilize R tm R package for querying and textmining of the NIPS Papers 2015
+```{r, warning=FALSE, message=FALSE}
+library(tm) ## texmining
+library(lda) ## the actual LDA model
+library(LDAvis) # visualization library for LDA
+library(RISmed)
+
+library(parallel) # multi-core paralellization
+
+library(data.table) # fread
+##library(Rmpfr) # harmonic mean maximization
+library(ggplot2) # pretty plotting lib
+library(reshape2) # reformatting lib for ggplot2
+
+library(tsne) # low dimensional embedding
+library(caret) # ml model wrapper lib, but only used for data transformation here
+
+
+## Load previous model and preproc objects such that not
+## everything has to be run again
+load("immunoTopicModels.rda")
+load("vocab.rda")
+load("termTable.rda")
+load("documents.rda")
+load("LMats.rda")
+```
+
+# Helper Functions
+```{r}
+#' Copy arguments into env and re-bind any function's lexical scope to bindTargetEnv .
+#' 
+#' See http://winvector.github.io/Parallel/PExample.html for example use.
+#' 
+#' 
+#' Used to send data along with a function in situations such as parallel execution 
+#' (when the global environment would not be available).  Typically called within 
+#' a function that constructs the worker function to pass to the parallel processes
+#' (so we have a nice lexical closure to work with).
+#' 
+#' @param bindTargetEnv environment to bind to
+#' @param objNames additional names to lookup in parent environment and bind
+#' @param names of functions to NOT rebind the lexical environments of
+bindToEnv <- function(bindTargetEnv=parent.frame(), objNames, doNotRebind=c()) {
+  # Bind the values into environment
+  # and switch any functions to this environment!
+  for(var in objNames) {
+    val <- get(var, envir=parent.frame())
+    if(is.function(val) && (!(var %in% doNotRebind))) {
+      # replace function's lexical environment with our target (DANGEROUS)
+      environment(val) <- bindTargetEnv
+    }
+    # assign object to target environment, only after any possible alteration
+    assign(var, val, envir=bindTargetEnv)
+  }
+}
+
+startCluster <- function(cores=detectCores()) {
+  cluster <- makeCluster(cores)
+  return(cluster)
+}
+
+shutDownCluster <- function(cluster) {
+  if(!is.null(cluster)) {
+    stopCluster(cluster)
+    cluster <- c()
+  }
+}
+
+harmonicMean = function(logLikelihoods, precision=2000L) {
+  llMed = median(logLikelihoods)
+  as.double(llMed - log(mean(exp(-mpfr(logLikelihoods,
+                                       prec = precision) + llMed))))
+}
+
+argmax <- function(x) {
+  which(x==max(x))
+}
+
+argmin <- function(x) {
+  which(x==min(x))
+}
+
+## Compute argmax over 
+mat_argmax <- function(X) {
+  row_argmax <- argmax(apply(X, 1, max))
+  col_argmax <- argmax(apply(X, 2, max))
+  result <- c(row_argmax, col_argmax)
+  return(result)
+}
+
+## Compute maximum likelihood for model likelihood matrix with k topics
+mat_max <- function(X) {
+  result <- X[mat_argmax(X)[1], mat_argmax(X)[2]]
+  return(result)
+}
+
+# params <- expand.grid(G=G,
+#                       k=k,
+#                       alpha=seq(0.01, 100, length.out=10),
+#                       eta=seq(0.01, 100, length.out=10))
+
+## TODO: Check whether the matrix is filled in the right order
+## returns a grid of harmonic mean log likelihoods
+## for a fixed number of topics k and a fixed number of iterations
+## gradient lines are plotted against the LDA hyperparameters alpha and eta
+LMatrix <- function(k, params, models) {
+  topic.params <- params[which(params$k==k),]
+  indexes <- as.numeric(rownames(topic.params))
+  alpha <- unique(topic.params$alpha)
+  eta <- unique(topic.params$eta)
+  selectedModels <- models[indexes]
+  logLiks = lapply(selectedModels, function(m)  m$log.likelihoods[1, ])
+  harmMeanLogLiks <- sapply(logLiks, function(h) harmonicMean(h))
+  m <- matrix(harmMeanLogLiks, nrow=length(alpha), ncol=length(eta))
+  return(m)
+}
+
+getTopic <- function(topic.vec) {
+  argmax <- which(topic.vec==max(topic.vec))
+  if(length(argmax)>1){
+    argmax <- argmax[1]
+  }
+  return(argmax)
+}
+
+getTopicProportion <- function(topic.vec) {
+  return(topic.vec[getTopic(topic.vec)])
+}
+
+getModelByParams <- function(k, alpha, eta, params, models) {
+  k_ <- as.character(k)
+  alpha_ <- as.character(alpha)
+  eta_ <- as.character(eta)
+  params$k <- as.character(params$k)
+  params$alpha <- as.character(params$alpha)
+  params$eta <- as.character(params$eta)
+
+  param_subset <- subset(params, k==k_ & alpha==alpha_ & eta==eta_)
+  i <- rownames(param_subset)
+  return(models[[i]])
+}
+```
+
+# Read the NIPS 2015 Corpus
+
+First we will read all the nips papers in a data frame. We will use the abstracts for the training of our LDA.
+```{r, eval=FALSE}
+years = 1970:2016
+query = "cancer AND immuno AND therapy"
+
+r = EUtilsSummary(query, type="esearch", db="pubmed", 
+                  mindate=min(years), maxdate=max(years),
+                  retmax=3000)
+records = EUtilsGet(r)
+records
+
+docs <- AbstractText(records)
+```
+
+# Preprocessing
+To train the LDA in the later steps, we need the word frequencies in each of those abstracts. For representative word frequencies we removed a number of problematic characters, removed punctuation, control characters, whitespaces, stopwords which belonged to the SMART stopword collection, all words with less than 4 characters and words which occurred less than 4 times in the documents. Lastly we transformed each word to lowercase.
+
+```{r, eval=FALSE}
+stop_words_smart <- stopwords("SMART")
+stop_words_en <- stopwords("en")
+stop_words_custom <- c("background", "conclusions", "conclusion", "method", "methods", "result", "results", "introduction", "motivation", "material", "materials",
+                       "abstract", "purpose")
+docs <- gsub("[^[:^punct:]-]", " ", docs, perl = TRUE)
+## Replace common greek symbols from protein/gene identifiers
+docs <- gsub("[α]", "alpha", docs, perl = TRUE)
+docs <- gsub("[β]", "beta", docs, perl = TRUE)
+docs <- gsub("[γ]", "gamma", docs, perl = TRUE)
+docs <- gsub("[δ]", "delta", docs, perl = TRUE)
+docs <- gsub("[ε]", "epsilon", docs, perl = TRUE)
+docs <- gsub("[ζ]", "zeta", docs, perl = TRUE)
+docs <- gsub("[η]", "eta", docs, perl = TRUE)
+docs <- gsub("[ω]", "omega", docs, perl = TRUE)
+docs <- gsub("[[:cntrl:]]", " ", docs)  # replace control characters with space
+docs <- gsub("^[[:space:]]+", "", docs) # remove whitespace at beginning of documents
+docs <- gsub("[[:space:]]+$", "", docs) # remove whitespace at end of documents
+docs <- tolower(docs)  # force to lowercase
+
+# tokenize on space and output as a list:
+doc.list <- strsplit(docs, "[[:space:]]+")
+
+# Remove all words with less than 4 characters
+doc.list <- lapply(doc.list, function(x) x[sapply(x, nchar)>3])
+
+# compute the table of terms:
+term.table <- table(unlist(doc.list))
+term.table <- sort(term.table, decreasing = TRUE)
+
+# remove terms that are stop words or occur fewer than 5 times:
+del <- names(term.table) %in% stop_words_smart | names(term.table) %in% stop_words_en | names(term.table) %in% stop_words_custom | term.table < 5 | term.table > 500
+
+term.table <- term.table[!del]
+vocab <- names(term.table)
+```
+
+Next we reformated the documents into the format required by the lda package.
+```{r}
+get.terms <- function(x) {
+  index <- match(x, vocab)
+  index <- index[!is.na(index)]
+  rbind(as.integer(index - 1), as.integer(rep(1, length(index))))
+}
+documents <- lapply(doc.list, get.terms)
+#save(documents, file="documents.rda")
+```
+
+Before we start training our LDA, we first will calculate some statistics related to the data set:
+```{r}
+D <- length(documents)  # number of documents
+W <- length(vocab)  # number of terms in the vocab
+doc.length <- sapply(documents, function(x) sum(x[2, ]))  # number of tokens per document
+N <- sum(doc.length)  # total number of tokens in the data
+term.frequency <- as.integer(term.table)  # frequencies of terms in the corpus
+```
+
+```{r}
+df <- data.frame("NumberOfDocuments"=D, 
+                 "NumberOfTermsInVocabulary"=W,
+                 "TotalNumberOfTokensInCorpus"=N)
+colnames(df) <- c("Number Of Documents", "Number Of Terms In Vocabulary", "Total Number Of Tokens In Corpus")
+
+knitr::kable(df, digits = 0, caption = "Document Statistics")
+```
+
+# LDA Parameters
+Now we can define the parameters for our LDA Model. We will train LDA models assuming between 2 and 20 topics in out document corpus.
+TODO: Explain the different Parameters (see notes and http://videolectures.net/mlss09uk_blei_tm/)
+TODO: Tune the hyperparameters too, using expand.grid
+TODO: Fix harmonic mean normalization method. Harmonic mean always decreases with increasing number of topics. This cant be right.
+
+For the symmetric dirichlet distribution, a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. A low alpha value puts less such constraints on documents and means that it is more likely that a document may contain mixture of just a few, or even only one, of the topics. Likewise, a high beta-value means that each topic is likely to contain a mixture of most of the words, and not any word specifically, while a low value means that a topic may contain a mixture of just a few of the words.
+
+If, on the other hand, the distribution is asymmetric, a high alpha-value means that a specific topic distribution (depending on the base measure) is more likely for each document. Similarly, high beta-values means each topic is more likely to contain a specific word mix defined by the base measure.
+
+In practice, a high alpha-value will lead to documents being more similar in terms of what topics they contain. A high beta-value will similarly lead to topics being more similar in terms of what words they contain. (source: http://stats.stackexchange.com/questions/37405/natural-interpretation-for-lda-hyperparameters)
+
+```{r, eval=FALSE}
+## alpha and eta are hyperparameters contring the sparsity of the document/topic matrix (theta)
+## and the word/topic (lambda) sparsity
+# alpha   ## Papers are very specific such that a low alpha is more probable.
+# eta     ## The scalar value of the Dirichlet hyperparamater for topic multinomials.
+params <- expand.grid(G=100,
+                      k=seq(2, 20, by=1),
+                      alpha=seq(0.01, 0.5, length.out=10),
+                      eta=seq(0.01, 0.5, length.out=10))
+parLapplyParams <- setNames(split(params, seq(nrow(params))), rownames(params))
+```
+
+# Model Tuning
+With the parameters defined above we can now go on and train our set of models. For parallel computing we will define our worker function, which will bind all variables needed during training to the global environment, such that they are available for each core.
+TODO: Proper explaination on http://www.win-vector.com/blog/2016/01/parallel-computing-in-r/
+
+# Multi CPU Computation
+```{r, eval=FALSE}
+set.seed(42)
+
+worker <- function() {
+  bindToEnv(objNames=c("documents", "vocab"))
+  function(params) {
+    k <- params$k
+    G <- params$G
+    alpha <- params$alpha
+    eta <- params$eta
+    lda::lda.collapsed.gibbs.sampler(documents = documents, K = k, vocab = vocab, 
+                                     num.iterations = G, alpha = alpha, 
+                                     eta = eta, initial = NULL, burnin = 0,
+                                     compute.log.likelihood = TRUE)
+  }
+}
+
+t1 <- Sys.time()
+cluster <- startCluster()
+models <- parLapply(cluster, parLapplyParams, worker())
+shutDownCluster(cluster)
+t2 <- Sys.time()
+t2 - t1
+```
+
+# Single CPU Computation
+```{r, eval=FALSE}
+t1 <- Sys.time()
+models = lapply(ntopics, lda::lda.collapsed.gibbs.sampler(documents = documents, K = k, vocab = vocab, 
+                                                          num.iterations = params$G, alpha = params$alpha,
+                                                          eta = params$eta, initial = NULL, burnin = 0,
+                                                          compute.log.likelihood = TRUE))
+t2 <- Sys.time()
+t2 - t1
+```
+
+# Convergence
+To first let's have a look whether our models have converged after `r G` iterations. The following figure shows
+the harmonic mean log-likelihood in each iteration averaged over each model parameterized as defined above.
+
+```{r}
+logLiks = lapply(models, function(L)  L$log.likelihoods[1, ])
+logLiks.df <- as.data.frame(logLiks)
+meanLogLiks <- data.frame(Iteration=as.numeric(1:nrow(logLiks.df)), 
+                          logLikelihood=rowMeans(logLiks.df))
+logLiks.df$Iteration <- rownames(logLiks.df)
+colnames(logLiks.df) <- 1:ncol(logLiks.df)
+
+molten_logLiks <- melt(logLiks.df)
+colnames(molten_logLiks) <- c("Iteration", "Model", "logLikelihood")
+molten_logLiks$Iteration <- as.numeric(molten_logLiks$Iteration)
+
+ggplot(data=molten_logLiks) + 
+  geom_line(data = meanLogLiks, aes(x=Iteration, y=logLikelihood), 
+            color="black", linetype="dashed") +
+  theme_bw()
+```
+
+# Model Selection
+We will select our model based on harmonic mean maximization.
+TODO: Check http://epub.wu.ac.at/3558/1/main.pdf for proper explanation and comparison to other performance values.
+TODO: Fix harmonic mean calculation.
+```{r, eval=FALSE}
+## Maximum Likelihood Estimation of k, alpha and eta
+LMats <- lapply(unique(params$k), LMatrix, params, models)
+max_LMats <- sapply(LMats, mat_max)
+argmax_LMats <- lapply(LMats, mat_argmax)
+
+
+## Test whether matrix has been filled correctly and axis labels are correct
+# topic.params <- params[which(params$k==3),]
+# print(topic.params)
+# indexes <- as.numeric(rownames(topic.params))
+# alpha <- unique(topic.params$alpha)
+# eta <- unique(topic.params$eta)
+# selectedModels <- models[indexes]
+# logLiks = lapply(selectedModels, function(m)  m$log.likelihoods[1, ])
+# harmMeanLogLiks <- sapply(logLiks, function(h) harmonicMean(h))
+#
+# m <- melt(m_3)
+# colnames(m) <- c("alpha", "eta", "HarmonicMeanlogLikelihood" )
+# 
+# ggplot(data=m, aes(x=alpha, y=eta, z=HarmonicMeanlogLikelihood)) +
+#   stat_contour(bins=20, aes(colour = ..level..)) + 
+#   theme_bw()
+#
+# harmonicMean(models[[137]]$log.likelihoods[1, ]) ## alpha=55.56, eta=11.12 --> -218668.9
+# harmonicMean(models[[47]]$log.likelihoods[1, ])  ## alpha=55.56, eta=0.01 --> should be smaller than -218668.9
+# harmonicMean(models[[173]]$log.likelihoods[1, ])  ## alpha=100.00, eta=11.12 --> should be close to -218668.9
+
+## contour matrices for each k over alpha and eta hyper-parameters
+contourMatrices <- lapply(unique(params$k), paramMatrix, params, models[])
+## vector of argmax(likelihood) indices over all alphas of each contour matrix
+opt_alphas <- sapply(contourMatrices, function(m) which(rowSums(m)==max(rowSums(m))))
+## vector of argmax(likelihood) indices over all etas of each contour matrix
+opt_etas   <- sapply(contourMatrices, function(m) which(colSums(m)==max(colSums(m))))
+logLiks    <- sapply(contourMatrices, function(m) max(apply(m, 1, max)))
+## Combine everything in a data frame including the optimal parameters over all LDAs with 
+## a fixed k and number of iterations G
+opt_params <- data.frame(k=unique(params$k), 
+                         alpha=names(opt_alphas), 
+                         eta=names(opt_etas),
+                         logLikelihood=logLiks)
+
+knitr::kable(opt_params, caption = "Optimal LDA hyper-parameter settings over all k and a fixed number of iterations G")
+
+ggplot(data=opt_params, aes(x=k, y=logLikelihood)) +
+  geom_line() +
+  theme_bw()
+```
+
+The further analysis will only consider the model with the maximum log-likelihood depicted in the table above.
+
+```{r, eval=FALSE}
+## This will select a model with 2 topics. This doesn't make sense, given some exploration beforehand
+## Especially with regard to the t-SNE dimensionality reduction which identifies about 8-9 clusters in the corpus.
+params <- as.data.frame(apply(params, 2, as.character))
+
+i <- which(opt_params$logLikelihood==max(opt_params$logLikelihood))
+opt_k <- as.character(opt_params[i, ]$k)
+opt_alpha <- as.character(opt_params[i, ]$alpha)
+opt_eta <- as.character(opt_params[i, ]$eta)
+opt_model_index <- as.numeric(rownames(subset(params, (k==opt_k & 
+                                                       alpha==opt_alpha & 
+                                                       eta==opt_eta))))
+opt_k <- as.numeric(opt_k)
+opt_alpha <- as.numeric(opt_alpha)
+opt_eta <- as.numeric(opt_eta)
+model <- models[[opt_model_index]]
+```
+
+
+```{r, eval=FALSE}
+m <- melt(contourMatrices[[i]])
+colnames(m) <- c("alpha", "eta", "HarmonicMeanlogLikelihood" )
+
+ggplot(data=m, aes(x=alpha, y=eta, z=HarmonicMeanlogLikelihood)) +
+  geom_vline(xintercept = opt_alpha, colour="red", linetype = "longdash", alpha=0.5) +
+  geom_hline(yintercept = opt_eta, colour="red", linetype = "longdash", alpha=0.5) +
+  stat_contour(bins=20, aes(colour = ..level..)) +
+  theme_bw()
+```
+
+The optimal model is described by the following parameters: alpha=`r opt_alpha` and eta=`r opt_eta`.
+
+# Get the top 5 words defining the first 5 topics
+```{r, eval=FALSE}
+N <- 5 
+top.words <- top.topic.words(model$topics, 5, by.score=TRUE)
+top.words.df <- as.data.frame(top.words)
+colnames(top.words.df) <- 1:opt_k
+
+knitr::kable(top.words.df[ ,1:opt_k], caption = "Top 5 terms per topic")
+```
+
+# Get the top 5 documents assigned to the first 5 topics
+```{r, eval=FALSE, echo=FALSE} 
+top.documents <- top.topic.documents(model$document_sums, 
+                                     num.documents = 20, 
+                                     alpha = opt_alpha)
+top.documents.df <- as.data.frame(top.documents)
+colnames(top.documents.df) <- 1:opt_k
+
+top.documents.df.part <- head(top.documents.df, 10)
+topic_titles <- data.frame(lapply(1:opt_k, function(k) papers[as.numeric(top.documents.df.part[ ,k]),]$Title))
+colnames(topic_titles) <- 1:opt_k
+
+knitr::kable(topic_titles, caption = "Top 10 titles per topic")
+```
+
+# Get maximum proportion topic for each document
+First we will compute to which proportion a document belongs to a topic. As zero values and NAs will be a problem in the succeeding steps we will add a small number to each element in the topic proportion matrix. The topic with the maximum proportion value will then be assigned to the document. Proportion is a measure indicating the number of times words in each document were assigned to each topic. 
+```{r, eval=FALSE}
+topic.proportions <- t(model$document_sums) / colSums(model$document_sums)
+topic.proportions <- topic.proportions + 0.000000001 ## Laplace smoothing
+
+getTopic <- function(topic.vec) {
+  argmax <- which(topic.vec==max(topic.vec))
+  if(length(argmax)>1){
+    argmax <- argmax[1]
+  }
+  return(argmax)
+}
+
+getTopicProportion <- function(topic.vec) {
+  return(topic.vec[getTopic(topic.vec)])
+}
+
+# assign each document the topic with maximum probability
+doc.topic <- unlist(apply(topic.proportions, 1, getTopic))
+doc.maxTopicProportion <- unlist(apply(topic.proportions, 1, getTopicProportion))
+doc.topic.words <- apply(top.words[, doc.topic], 2, paste, collapse=".")
+```
+
+Each document can be seen as a mixture of topics as exemplified in the figure below.
+```{r, echo=FALSE, eval=FALSE}
+N <- 4
+tp <- topic.proportions[sample(1:dim(topic.proportions)[1], N),]
+colnames(tp) <- apply(top.words, 2, paste, collapse=" ")
+tp.df <- melt(cbind(data.frame(tp),
+                    document=factor(1:N)),
+              variable.name="topic",
+              id.vars = "document")  
+
+
+ggplot(data=tp.df, aes(x=topic, y=value, fill=document)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  coord_flip() +
+  facet_wrap(~ document, ncol=2) +
+  theme_bw()
+```
+
+# Compute similarity between documents
+A document is defined as a mixture of topics, each with a certain probability. In other words a document is to some proportion, part of each topic. Given two proportion vectors, a similarity can be computed between two documents. A similarity measure between two probability distributions, can be computed using the Jensen-Shannon divergence (JSD) (TODO: citation), which can be derived from the Kullback-Leibler divergence. (TODO: LaTeX formula of JSD) The JSD is defined as follows
+
+```{r, eval=FALSE}
+## Compute Jensen-Shannon Divergence between documents
+## p,q probability distribution vectors R^n /in [0,1]
+JSD <- function(p, q) {
+  m <- 0.5 * (p + q)
+  divergence <- 0.5 * (sum(p * log(p / m)) + sum(q * log(q / m)))
+  return(divergence)
+}
+```
+
+With this we can compute the pairwise similarity between each document.
+```{r, eval=FALSE}
+n <- dim(topic.proportions)[1]
+X <- matrix(rep(0, n*n), nrow=n, ncol=n)
+indexes <- t(combn(1:nrow(topic.proportions), m=2))
+for (r in 1:nrow(indexes)) {
+  i <- indexes[r, ][1]
+  j <- indexes[r, ][2]
+  p <- topic.proportions[i, ]
+  q <- topic.proportions[j, ]
+  X[i, j] <- JSD(p,q) 
+}
+X <- X+t(X)
+```
+
+```{r}
+X_dist <- sqrt(X) # compute Jensen-Shannon Distance
+```
+
+## Clustering and Dimension Reduction of Jensen-Shannon Distance matrix
+To visualize the results we have to reduce the dimensionality of our document similarity matrix. To do this we need a distance matrix. Taking the square root of the JSD matrix results in a metric called Jensen-Shannon distance, which can be used in hirarchical clustering as well as, dimensionality reduction algorithms.
+```{r, eval=FALSE, echo=FALSE}
+library(apcluster)
+## run affinity propagation
+apres <- apcluster(X_dist, details=TRUE)
+show(apres)
+
+## plot information about clustering run
+plot(apres)
+
+## plot clustering result
+plot(apres, X_dist)
+
+## employ agglomerative clustering to join clusters
+aggres <- aggExCluster(sim, apres)
+
+## show information
+show(aggres)
+show(cutree(aggres, 2))
+
+## plot dendrogram
+plot(aggres)
+
+## plot clustering result for k=2 clusters
+plot(aggres, X_dist, k=2)
+
+## plot heatmap
+heatmap(apres, sim)
+```
+
+For exploratory purposes we will embedd the distance matrix onto a 2-dimensional plane using different projection methods, Multidimensional Scaling (TODO: citation), Principal Component Analysis (TODO: cite) and t-SNE (TODO: cite).
+
+TODO: init_dims and perplexity has to be tuned for t-SNE. It is yet unclear how to do this properly
+```{r, eval=FALSE}
+worker <- function() {
+  bindToEnv(objNames=c("topic.proportions", "opt_k"))
+  function(perplexity) {
+    tsne::tsne(topic.proportions, k=2, initial_dims=opt_k+1, perplexity=perplexity)
+  }
+}
+
+perplexities <- seq(5, 50, by=5)
+t1 <- Sys.time()
+cluster <- startCluster()
+X_tSNE_projections <- parLapply(cluster, perplexities, worker())
+shutDownCluster(cluster)
+t2 <- Sys.time()
+t2 - t1
+
+X_tSNE_projected <- X_tSNE_projections[[1]]
+
+
+X_MDS_projected <- cmdscale(X_dist, k = 2) ## Multi dimensional scaling
+# X_tSNE_projected <- tsne(topic.proportions, k = 2, initial_dims = opt_k+1, perplexity = 40) ## t-SNE projection
+preProc = preProcess(topic.proportions, method=c("center", "scale", "pca"))
+X_PCA_projected = predict(preProc, topic.proportions)[,1:2] # PCA projection
+
+projections <- data.frame(Topic=as.factor(doc.topic), 
+                          TopWords=as.factor(doc.topic.words),
+                          Proportion=doc.maxTopicProportion,
+                          Title=papers$Title,
+                          EventType=papers$EventType,
+                          Abstract=papers$Abstract,
+                          x_pca=X_PCA_projected[, 1], 
+                          y_pca=X_PCA_projected[, 2],
+                          x_mds=X_MDS_projected[, 1], 
+                          y_mds=X_MDS_projected[, 2],
+                          x_tsne=X_tSNE_projected[, 1], 
+                          y_tsne=X_tSNE_projected[, 2])
+```
+
+Now let's have a look at the results using the interactive plotting library rbokeh, with which it is possible to select certain clusters in each projection, a method called linked brushing.
+
+```{r, eval=FALSE}
+tools <- c("pan", 
+           "wheel_zoom", "box_zoom", 
+           "box_select", "lasso_select", 
+           "reset", "save")                            
+## PCA Plot
+pca_fig <- figure(tools=tools) %>%
+  ly_points(x_pca, y_pca, data = projections,
+            color = Topic, size = Proportion*10,
+            hover = list(TopWords, Proportion, Title, 
+                         EventType))
+## MDS Plot
+mds_fig <- figure(tools=tools) %>%
+  ly_points(x_mds, y_mds, data = projections,
+            color = Topic, size = Proportion*10,
+            hover = list(TopWords, Proportion, Title, 
+                         EventType))
+## t-SNE Plot
+tsne_fig <- figure(tools=tools) %>%
+  ly_points(x_tsne, y_tsne, data = projections,
+            color = Topic, size = Proportion*10,
+            hover = list(TopWords, Proportion, Title, 
+                         EventType))
+
+projList <- list(pca_fig, mds_fig, tsne_fig)
+p = grid_plot(projList, ncol=2, link_data=TRUE)
+p
+```
+
+# LDAVis Visualization
+```{r, eval=FALSE}
+theta <- t(apply(model$document_sums + opt_alpha, 2, function(x) x/sum(x)))
+phi <- t(apply(t(model$topics) + opt_eta, 2, function(x) x/sum(x)))
+
+modelParams <- list(phi = phi,
+                      theta = theta,
+                      doc.length = doc.length,
+                      vocab = vocab,
+                      term.frequency = term.frequency)
+
+# create the JSON object to feed the visualization:
+json <- createJSON(phi = modelParams$phi, 
+                   theta = modelParams$theta, 
+                   doc.length = modelParams$doc.length, 
+                   vocab = modelParams$vocab, 
+                   term.frequency = modelParams$term.frequency)
+
+serVis(json, out.dir = "vis", open.browser = FALSE)
+```
+
+```{r, echo=FALSE, eval=FALSE}
+tmp <- URLencode(paste(readLines("vis/index.html"), collapse="\n"))
+
+cat('<iframe src="', tmp ,
+    '" style="border: black; seamless:seamless; width: 800px; height: 200px"></iframe>')
+```
+
+# References
+
+http://winvector.github.io/Parallel/PExample.html
+http://www.win-vector.com/blog/2016/01/parallel-computing-in-r/
+https://eight2late.wordpress.com/2015/09/29/a-gentle-introduction-to-topic-modeling-using-r/
+https://www.cs.princeton.edu/~blei/papers/Blei2012.pdf
+https://www.aaai.org/ocs/index.php/ICWSM/ICWSM12/paper/viewFile/4645/5021
+http://epub.wu.ac.at/3558/1/main.pdf
+
+# Session Info
+```{r}
+sessionInfo()
+```

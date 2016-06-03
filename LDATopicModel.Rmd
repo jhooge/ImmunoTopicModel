@@ -2,6 +2,7 @@
 title: "Biomedical Topic Modeling on Cancer Immunotherapy"
 author: "Jens Hooge"
 date: "16. Februar 2016"
+runtime: shiny
 output: html_document
 ---
 
@@ -26,18 +27,17 @@ library(reshape2) # reformatting lib for ggplot2
 library(tsne) # low dimensional embedding
 library(caret) # ml model wrapper lib, but only used for data transformation here
 
-
 ## Load previous model and preproc objects such that not
 ## everything has to be run again
 load("immunoTopicModels.rda")
 load("vocab.rda")
 load("termTable.rda")
-load("documents.rda")
+load("preprocessedDocs.rda")
 load("LMats.rda")
 ```
 
 # Helper Functions
-```{r}
+```{r, echo=FALSE}
 #' Copy arguments into env and re-bind any function's lexical scope to bindTargetEnv .
 #' 
 #' See http://winvector.github.io/Parallel/PExample.html for example use.
@@ -152,7 +152,7 @@ getModelByParams <- function(k, alpha, eta, params, models) {
 }
 ```
 
-# Read the NIPS 2015 Corpus
+# Read the PubMed Corpus
 
 First we will read all the nips papers in a data frame. We will use the abstracts for the training of our LDA.
 ```{r, eval=FALSE}
@@ -171,7 +171,7 @@ docs <- AbstractText(records)
 # Preprocessing
 To train the LDA in the later steps, we need the word frequencies in each of those abstracts. For representative word frequencies we removed a number of problematic characters, removed punctuation, control characters, whitespaces, stopwords which belonged to the SMART stopword collection, all words with less than 4 characters and words which occurred less than 4 times in the documents. Lastly we transformed each word to lowercase.
 
-```{r, eval=FALSE}
+```{r, eval=TRUE}
 stop_words_smart <- stopwords("SMART")
 stop_words_en <- stopwords("en")
 stop_words_custom <- c("background", "conclusions", "conclusion", "method", "methods", "result", "results", "introduction", "motivation", "material", "materials",
@@ -191,11 +191,15 @@ docs <- gsub("^[[:space:]]+", "", docs) # remove whitespace at beginning of docu
 docs <- gsub("[[:space:]]+$", "", docs) # remove whitespace at end of documents
 docs <- tolower(docs)  # force to lowercase
 
+# save(docs, file="preprocessedDocs.rda")
+
 # tokenize on space and output as a list:
 doc.list <- strsplit(docs, "[[:space:]]+")
 
 # Remove all words with less than 4 characters
 doc.list <- lapply(doc.list, function(x) x[sapply(x, nchar)>3])
+
+# save(doc.list, file="docList.rda")
 
 # compute the table of terms:
 term.table <- table(unlist(doc.list))
@@ -249,7 +253,7 @@ If, on the other hand, the distribution is asymmetric, a high alpha-value means 
 
 In practice, a high alpha-value will lead to documents being more similar in terms of what topics they contain. A high beta-value will similarly lead to topics being more similar in terms of what words they contain. (source: http://stats.stackexchange.com/questions/37405/natural-interpretation-for-lda-hyperparameters)
 
-```{r, eval=FALSE}
+```{r}
 ## alpha and eta are hyperparameters contring the sparsity of the document/topic matrix (theta)
 ## and the word/topic (lambda) sparsity
 # alpha   ## Papers are very specific such that a low alpha is more probable.
@@ -303,7 +307,7 @@ t2 - t1
 ```
 
 # Convergence
-To first let's have a look whether our models have converged after `r G` iterations. The following figure shows
+To first let's have a look whether our models have converged after `r params$G` iterations. The following figure shows
 the harmonic mean log-likelihood in each iteration averaged over each model parameterized as defined above.
 
 ```{r}
@@ -335,6 +339,19 @@ max_LMats <- sapply(LMats, mat_max)
 argmax_LMats <- lapply(LMats, mat_argmax)
 
 
+logLikContour <- function(mat) {
+  filled.contour(x = unique(params$alpha),
+                 y = unique(params$eta),
+                 z = mat,
+                 color.palette = colorRampPalette(c("blue", "green", "yellow",
+                                                     "orange", "red")),
+                 xlab = "alpha",
+                 ylab = "eta",
+                 main = "Mean Harmonic Log Likelihood Contour")
+}
+
+logLikContour(LMats[[14]])
+
 ## Test whether matrix has been filled correctly and axis labels are correct
 # topic.params <- params[which(params$k==3),]
 # print(topic.params)
@@ -357,17 +374,20 @@ argmax_LMats <- lapply(LMats, mat_argmax)
 # harmonicMean(models[[173]]$log.likelihoods[1, ])  ## alpha=100.00, eta=11.12 --> should be close to -218668.9
 
 ## contour matrices for each k over alpha and eta hyper-parameters
-contourMatrices <- lapply(unique(params$k), paramMatrix, params, models[])
 ## vector of argmax(likelihood) indices over all alphas of each contour matrix
-opt_alphas <- sapply(contourMatrices, function(m) which(rowSums(m)==max(rowSums(m))))
+opt_alphas_idx <- sapply(LMats, function(m) which(rowSums(m)==max(rowSums(m))))
+opt_alphas <- unique(params$alpha)[opt_alphas_idx]
 ## vector of argmax(likelihood) indices over all etas of each contour matrix
-opt_etas   <- sapply(contourMatrices, function(m) which(colSums(m)==max(colSums(m))))
-logLiks    <- sapply(contourMatrices, function(m) max(apply(m, 1, max)))
-## Combine everything in a data frame including the optimal parameters over all LDAs with 
-## a fixed k and number of iterations G
+opt_etas_idx   <- sapply(LMats, function(m) which(colSums(m)==max(colSums(m))))
+opt_etas <- unique(params$eta)[opt_etas_idx]
+logLiks    <- sapply(LMats, function(m) max(apply(m, 1, max)))
+## Combine everything in a data frame including the optimal parameters over all LDAs with a fixed k and number of iterations G
+
+
+
 opt_params <- data.frame(k=unique(params$k), 
-                         alpha=names(opt_alphas), 
-                         eta=names(opt_etas),
+                         alpha=opt_alphas, 
+                         eta=opt_etas,
                          logLikelihood=logLiks)
 
 knitr::kable(opt_params, caption = "Optimal LDA hyper-parameter settings over all k and a fixed number of iterations G")
@@ -377,61 +397,48 @@ ggplot(data=opt_params, aes(x=k, y=logLikelihood)) +
   theme_bw()
 ```
 
-The further analysis will only consider the model with the maximum log-likelihood depicted in the table above.
 
-```{r, eval=FALSE}
-## This will select a model with 2 topics. This doesn't make sense, given some exploration beforehand
-## Especially with regard to the t-SNE dimensionality reduction which identifies about 8-9 clusters in the corpus.
-params <- as.data.frame(apply(params, 2, as.character))
-
-i <- which(opt_params$logLikelihood==max(opt_params$logLikelihood))
-opt_k <- as.character(opt_params[i, ]$k)
-opt_alpha <- as.character(opt_params[i, ]$alpha)
-opt_eta <- as.character(opt_params[i, ]$eta)
-opt_model_index <- as.numeric(rownames(subset(params, (k==opt_k & 
-                                                       alpha==opt_alpha & 
-                                                       eta==opt_eta))))
-opt_k <- as.numeric(opt_k)
-opt_alpha <- as.numeric(opt_alpha)
-opt_eta <- as.numeric(opt_eta)
-model <- models[[opt_model_index]]
+It does not seem to be possible to tune for alpha, eta or k using the log-likelihood functions depicted above.
+```{r, echo=FALSE}
+alpha <- unique(params$alpha)[3]
+eta <- unique(params$alpha)[1]
+k <- unique(params$k)[14]
+model <- models[[k-1]]
 ```
 
+For further analysis, we will choose alpha=`r alpha` and eta=`r eta` and have a closer look at the model with different k=`r k`.
 
-```{r, eval=FALSE}
-m <- melt(contourMatrices[[i]])
-colnames(m) <- c("alpha", "eta", "HarmonicMeanlogLikelihood" )
 
-ggplot(data=m, aes(x=alpha, y=eta, z=HarmonicMeanlogLikelihood)) +
-  geom_vline(xintercept = opt_alpha, colour="red", linetype = "longdash", alpha=0.5) +
-  geom_hline(yintercept = opt_eta, colour="red", linetype = "longdash", alpha=0.5) +
-  stat_contour(bins=20, aes(colour = ..level..)) +
-  theme_bw()
-```
 
-The optimal model is described by the following parameters: alpha=`r opt_alpha` and eta=`r opt_eta`.
+
+
+
+
+
+
 
 # Get the top 5 words defining the first 5 topics
+TODO: This part is not needed anymore, as the top words for each model is depicted in the barcharts that had been generated previously
 ```{r, eval=FALSE}
 N <- 5 
 top.words <- top.topic.words(model$topics, 5, by.score=TRUE)
 top.words.df <- as.data.frame(top.words)
-colnames(top.words.df) <- 1:opt_k
-
-knitr::kable(top.words.df[ ,1:opt_k], caption = "Top 5 terms per topic")
+# colnames(top.words.df) <- 2:(max(params$k)-1)
+# 
+# knitr::kable(top.words.df[ ,1:max(params$k)], caption = "Top 5 terms per topic")
 ```
 
 # Get the top 5 documents assigned to the first 5 topics
 ```{r, eval=FALSE, echo=FALSE} 
 top.documents <- top.topic.documents(model$document_sums, 
                                      num.documents = 20, 
-                                     alpha = opt_alpha)
+                                     alpha = alpha)
 top.documents.df <- as.data.frame(top.documents)
-colnames(top.documents.df) <- 1:opt_k
+colnames(top.documents.df) <- 1:k
 
 top.documents.df.part <- head(top.documents.df, 10)
-topic_titles <- data.frame(lapply(1:opt_k, function(k) papers[as.numeric(top.documents.df.part[ ,k]),]$Title))
-colnames(topic_titles) <- 1:opt_k
+topic_titles <- data.frame(lapply(1:k, function(k) papers[as.numeric(top.documents.df.part[ ,k]),]$Title))
+colnames(topic_titles) <- 1:k
 
 knitr::kable(topic_titles, caption = "Top 10 titles per topic")
 ```
@@ -507,7 +514,7 @@ for (r in 1:nrow(indexes)) {
 X <- X+t(X)
 ```
 
-```{r}
+```{r, eval=FALSE}
 X_dist <- sqrt(X) # compute Jensen-Shannon Distance
 ```
 
